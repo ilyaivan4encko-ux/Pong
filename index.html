@@ -1,0 +1,546 @@
+<meta name='viewport' content='width=device-width, initial-scale=1'/><!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Multiplayer Pong — P2P (WebRTC)</title>
+<style>
+  :root{--bg:#071428;--panel:#0e2130;--accent:#5eead4;--muted:#9fb3c8}
+  body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#041424,#071428);color:#dff6f2;display:flex;flex-direction:column;min-height:100vh}
+  .wrap{max-width:980px;margin:12px auto;padding:12px}
+  header{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  h1{margin:0;font-size:18px;color:var(--accent)}
+  #gameArea{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+  canvas{background:#001922;border-radius:8px;display:block;touch-action:none}
+  .panel{background:linear-gradient(180deg,#072932,#052225);padding:10px;border-radius:8px;width:320px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  textarea{width:100%;height:90px;background:#062a2a;color:#e7fff9;border-radius:6px;padding:8px;border:1px solid rgba(255,255,255,0.04);resize:vertical}
+  button{padding:8px 10px;border-radius:8px;border:none;background:var(--accent);color:#033;cursor:pointer;margin:6px 0}
+  .muted{color:var(--muted);font-size:13px}
+  .row{display:flex;gap:8px;align-items:center}
+  .small{font-size:13px;color:var(--muted)}
+  .controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  footer{margin-top:12px;color:var(--muted);font-size:13px;text-align:center}
+  input[type="file"]{display:none}
+  @media(max-width:760px){ .panel{width:100%} canvas{width:100%;height:360px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Multiplayer Pong — P2P (WebRTC)</h1>
+    <div class="muted">Играй с другом — обмен предложением вручную</div>
+  </header>
+
+  <div id="gameArea">
+    <div style="flex:1;min-width:360px">
+      <canvas id="canvas" width="900" height="500" tabindex="0"></canvas>
+
+      <div class="row" style="margin-top:8px;gap:12px;align-items:center">
+        <div class="small">Роль: <strong id="roleLabel">не подключен</strong></div>
+        <div class="small">Игрок: <input id="nameInput" style="padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:#eafffb" value="Player" /></div>
+        <button id="startLocal">Играть локально</button>
+      </div>
+
+      <div class="controls">
+        <button id="btnHost" style="background:#ffd166;color:#042">Создать offer (хост)</button>
+        <button id="btnClient" style="background:#89cff0;color:#022">Я — клиент (вставить offer)</button>
+        <button id="btnDisconnect" style="background:#ff7ab6;color:#111">Отключиться</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="small">1) Если вы — хост: нажмите <strong>Создать offer</strong>, скопируйте текст и отправьте другу (мессенджер/QR).</div>
+      <div style="margin-top:8px">
+        <textarea id="offerOut" placeholder="Offer появится здесь..." readonly></textarea>
+        <button id="copyOffer">Скопировать Offer</button>
+      </div>
+
+      <hr style="opacity:.06;margin:10px 0" />
+
+      <div class="small">2) Если вы — клиент: вставьте offer от хоста сюда и нажмите <strong>Создать answer</strong>, затем пришлите answer хосту (или хост вставит автоматически).</div>
+      <textarea id="offerIn" placeholder="Вставьте сюда offer от хоста..."></textarea>
+      <div class="row">
+        <button id="createAnswer" style="background:#7ee7a6;color:#022">Создать Answer</button>
+        <button id="pasteAnswer" style="background:#ffd166;color:#042">Вставить Answer (хост)</button>
+      </div>
+      <textarea id="answerOut" placeholder="Answer появится здесь..." readonly style="margin-top:8px;height:70px"></textarea>
+
+      <hr style="opacity:.06;margin:10px 0" />
+
+      <div class="small">Подключение: <span id="connState">нет</span></div>
+      <div style="margin-top:8px" class="row">
+        <button id="exportSave">Экспорт рекордов</button>
+        <label for="fileImport" style="background:transparent;border:1px solid rgba(255,255,255,0.06);padding:6px;border-radius:6px;cursor:pointer">Импорт</label>
+        <input id="fileImport" type="file" accept="application/json" />
+      </div>
+
+      <div style="margin-top:8px" class="small">
+        Рекорды (локально): <span id="localRec">0 - 0</span><br/>
+        Подсказка: лучше открыть на двух устройствах и обменяться offer/answer.
+      </div>
+    </div>
+  </div>
+
+  <footer>Поддерживаются сенсорные экраны и клавиатура. Нужна помощь? Напиши — добавлю автоматический сигналинг/QR.</footer>
+</div>
+
+<script>
+/*
+  Multiplayer Pong — single file.
+  - Uses WebRTC DataChannel for P2P networking.
+  - Host creates offer and controls authoritative game state (ball, scores).
+  - Client sends paddle input; host sends world state updates.
+  - Manual signal exchange (copy/paste).
+  - Local saves (localStorage) with export/import.
+*/
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+function fitCanvas(){
+  const maxW = Math.min(window.innerWidth - 40, 980);
+  const targetW = maxW;
+  const ratio = W / H;
+  const targetH = Math.round(targetW / ratio);
+  canvas.style.width = targetW + 'px';
+  canvas.style.height = targetH + 'px';
+}
+fitCanvas(); window.addEventListener('resize', fitCanvas);
+
+// UI elements
+const btnHost = document.getElementById('btnHost');
+const btnClient = document.getElementById('btnClient');
+const btnDisconnect = document.getElementById('btnDisconnect');
+const offerOut = document.getElementById('offerOut');
+const offerIn = document.getElementById('offerIn');
+const createAnswer = document.getElementById('createAnswer');
+const answerOut = document.getElementById('answerOut');
+const pasteAnswer = document.getElementById('pasteAnswer');
+const connState = document.getElementById('connState');
+const nameInput = document.getElementById('nameInput');
+const roleLabel = document.getElementById('roleLabel');
+const copyOffer = document.getElementById('copyOffer');
+const startLocal = document.getElementById('startLocal');
+const exportSave = document.getElementById('exportSave');
+const fileImport = document.getElementById('fileImport');
+const localRec = document.getElementById('localRec');
+
+let pc = null;
+let dataChannel = null;
+let role = null; // "host" or "client" or "local"
+let connected = false;
+
+// STUN servers (public)
+const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+// Game state
+const state = {
+  // paddles' y positions (center)
+  p1y: 0,
+  p2y: 0,
+  pW: 12,
+  pH: 100,
+  ball: { x: W/2, y: H/2, vx: 6, vy: 3 },
+  score1: 0,
+  score2: 0,
+  running: false
+};
+
+// Local settings & saves
+const SAVE_KEY = 'p2p_pong_save_v1';
+let save = { records: [], name: 'Player' };
+function loadSave(){ try{ const raw = localStorage.getItem(SAVE_KEY); if(raw) save = JSON.parse(raw); }catch(e){} updateSaveUI(); }
+function saveToStorage(){ try{ localStorage.setItem(SAVE_KEY, JSON.stringify(save)); }catch(e){} updateSaveUI(); }
+function updateSaveUI(){ localRec.textContent = save.records.length ? save.records.join(' | ') : 'нет' }
+loadSave();
+
+// simple helper to show conn state
+function setConn(s){ connState.textContent = s; }
+
+// Create RTCPeerConnection and handlers
+function createPeerConnection(){
+  pc = new RTCPeerConnection(rtcConfig);
+  pc.onicecandidate = (ev)=>{
+    // ICE candidates are included in SDP automatically; with manual copy/paste
+    // some browsers require gathering complete before copying — we wait until 'icegatheringstate' == 'complete' below
+  };
+  pc.onconnectionstatechange = ()=>{
+    setConn(pc.connectionState);
+    if(pc.connectionState === 'connected'){ connected = true; roleLabel.textContent = role === 'host' ? 'Хост' : (role === 'client' ? 'Клиент' : 'Локально'); }
+    if(pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed'){
+      connected = false; roleLabel.textContent = 'не подключен';
+    }
+  };
+  pc.ondatachannel = (ev)=>{
+    console.log('datachannel incoming', ev.channel.label);
+    setupDataChannel(ev.channel);
+  };
+}
+
+function setupDataChannel(ch){
+  dataChannel = ch;
+  dataChannel.onopen = ()=>{ console.log('DC open'); setConn('datachannel open'); connected = true; };
+  dataChannel.onclose = ()=>{ console.log('DC close'); connected = false; setConn('closed'); };
+  dataChannel.onmessage = (ev)=>{
+    handleMessage(ev.data);
+  };
+}
+
+// message protocol (JSON)
+function sendMsg(obj){
+  if(!dataChannel || dataChannel.readyState !== 'open') return;
+  dataChannel.send(JSON.stringify(obj));
+}
+
+// Host: create offer and wait for client answer
+btnHost.addEventListener('click', async ()=>{
+  role = 'host';
+  createPeerConnection();
+  // create reliable ordered data channel
+  const dc = pc.createDataChannel('game', { ordered:true });
+  setupDataChannel(dc);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // wait for ICE gathering to complete so SDP contains candidates
+  await waitForIceGatheringComplete(pc);
+
+  offerOut.value = JSON.stringify(pc.localDescription);
+  roleLabel.textContent = 'Создан offer — отправьте другу';
+  setConn('offer создан');
+});
+
+// Client: paste offer and create answer
+btnClient.addEventListener('click', async ()=>{
+  role = 'client';
+  const txt = offerIn.value.trim();
+  if(!txt){ alert('Вставьте SDP offer от хоста'); return; }
+  createPeerConnection();
+  const offerDesc = new RTCSessionDescription(JSON.parse(txt));
+  await pc.setRemoteDescription(offerDesc);
+
+  // create answer
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitForIceGatheringComplete(pc);
+  answerOut.value = JSON.stringify(pc.localDescription);
+  roleLabel.textContent = 'Answer создан — отправьте хосту';
+  setConn('answer создан');
+});
+
+// Host pastes answer from client
+pasteAnswer.addEventListener('click', async ()=>{
+  if(!pc || !pc.localDescription){ alert('Сначала создайте offer (хост)'); return; }
+  const txt = answerOut.value.trim();
+  // If answerOut is empty, read from user-pasted area (offerIn reused)
+  let maybe = document.getElementById('offerIn').value.trim();
+  if(!maybe && !txt){ alert('Вставьте answer от клиента в поле ниже (Вставьте Answer)'); return; }
+  const answerTxt = txt || maybe;
+  try{
+    const ansDesc = new RTCSessionDescription(JSON.parse(answerTxt));
+    await pc.setRemoteDescription(ansDesc);
+    setConn('connected (подождите)');
+  }catch(e){ alert('Не удалось установить answer: ' + e); }
+});
+
+// copy offer button
+copyOffer.addEventListener('click', ()=>{ offerOut.select(); document.execCommand('copy'); showToast('Скопировано'); });
+
+// helper: wait until iceGatheringState === 'complete' or timeout
+function waitForIceGatheringComplete(pcConn){
+  return new Promise(resolve=>{
+    if(pcConn.iceGatheringState === 'complete') return resolve();
+    function check(){ if(pcConn.iceGatheringState === 'complete') { pcConn.removeEventListener('icegatheringstatechange', check); resolve(); } }
+    pcConn.addEventListener('icegatheringstatechange', check);
+    // fallback timeout 3s
+    setTimeout(resolve, 3000);
+  });
+}
+
+/* Message handling:
+   - client -> host: {type:'input', y: paddleCenterY, name}
+   - host -> client: {type:'state', p1y, p2y, ball, score1, score2}
+   - both -> each other: {type:'chat'} (not used)
+*/
+function handleMessage(raw){
+  let obj;
+  try{ obj = JSON.parse(raw); }catch(e){ console.warn('bad msg', raw); return; }
+  if(obj.type === 'input' && role === 'host'){
+    // client input arrives; copy to p2 (client is player 2)
+    state.p2y = obj.y;
+    // optional: remember name
+    if(obj.name) save.nameOpponent = obj.name;
+  } else if(obj.type === 'state' && role === 'client'){
+    // authoritative state from host -> override local
+    state.p1y = obj.p1y;
+    state.p2y = obj.p2y;
+    state.ball = obj.ball;
+    state.score1 = obj.score1;
+    state.score2 = obj.score2;
+  } else if(obj.type === 'chat'){
+    console.log('chat', obj.msg);
+  }
+}
+
+// DISCONNECT
+btnDisconnect.addEventListener('click', ()=>{
+  if(pc) { pc.close(); pc = null; dataChannel = null; connected = false; setConn('disconnected'); roleLabel.textContent = 'не подключен'; }
+});
+
+// Local play (no network) useful for practicing
+startLocal.addEventListener('click', ()=>{
+  role = 'local';
+  roleLabel.textContent = 'Локальный';
+  resetGame();
+  state.running = true;
+});
+
+// EXPORT/IMPORT saves
+exportSave.addEventListener('click', ()=>{ const data = JSON.stringify(save, null,2); const blob = new Blob([data],{type:'application/json'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'p2p_pong_save.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); showToast('Экспортировано'); });
+fileImport.addEventListener('change', (ev)=>{ const f = ev.target.files[0]; if(!f) return; const r = new FileReader(); r.onload = ()=>{ try{ save = JSON.parse(r.result); saveToStorage(); showToast('Импортировано'); }catch(e){ showToast('Ошибка импорта'); } }; r.readAsText(f); ev.target.value=''; });
+
+// Game physics & rendering
+let lastTime = 0;
+function resetGame(){
+  state.p1y = H/2;
+  state.p2y = H/2;
+  state.ball.x = W/2; state.ball.y = H/2;
+  state.ball.vx = 6 * (Math.random() < 0.5 ? 1 : -1);
+  state.ball.vy = (Math.random()*4 - 2);
+  state.score1 = 0; state.score2 = 0;
+  state.running = false;
+}
+
+resetGame();
+
+// host tick: authoritative updates ball & collisions
+function hostTick(dt){
+  if(!state.running) return;
+  // move ball
+  state.ball.x += state.ball.vx * dt;
+  state.ball.y += state.ball.vy * dt;
+
+  // top/bottom bounce
+  if(state.ball.y < 10){ state.ball.y = 10; state.ball.vy *= -1; }
+  if(state.ball.y > H-10){ state.ball.y = H-10; state.ball.vy *= -1; }
+
+  // paddles (clamp)
+  const halfH = state.pH/2;
+  state.p1y = clamp(state.p1y, halfH, H-halfH);
+  state.p2y = clamp(state.p2y, halfH, H-halfH);
+
+  // check collisions with paddles
+  // p1 at x=30, p2 at x=W-30
+  if(state.ball.x < 40){
+    if(Math.abs(state.ball.y - state.p1y) < state.pH/2 + 8){
+      state.ball.x = 40; state.ball.vx *= -1.05; // speed up slightly
+      // add spin based on where it hit
+      const delta = (state.ball.y - state.p1y) / (state.pH/2);
+      state.ball.vy += delta * 3;
+    } else {
+      // p2 scores
+      state.score2++;
+      resetBall(-1);
+    }
+  } else if(state.ball.x > W-40){
+    if(Math.abs(state.ball.y - state.p2y) < state.pH/2 + 8){
+      state.ball.x = W-40; state.ball.vx *= -1.05;
+      const delta = (state.ball.y - state.p2y) / (state.pH/2);
+      state.ball.vy += delta * 3;
+    } else {
+      state.score1++;
+      resetBall(1);
+    }
+  }
+
+  // send state to client
+  if(dataChannel && dataChannel.readyState === 'open'){
+    sendMsg({type:'state', p1y:state.p1y, p2y:state.p2y, ball:state.ball, score1:state.score1, score2:state.score2});
+  }
+}
+
+function resetBall(direction){
+  state.ball.x = W/2; state.ball.y = H/2;
+  state.ball.vx = 6 * direction;
+  state.ball.vy = (Math.random()*4 - 2);
+}
+
+// client acts by sending input (its paddle y) periodically
+let lastInputSent = 0;
+function clientTick(dt){
+  if(!state.running) return;
+  // send input ~30 times/sec
+  lastInputSent += dt;
+  if(lastInputSent > 1/30){
+    lastInputSent = 0;
+    if(dataChannel && dataChannel.readyState === 'open'){
+      sendMsg({type:'input', y: state.p2y, name: nameInput.value});
+    }
+  }
+}
+
+// rendering
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // background
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#001f23'); g.addColorStop(1,'#00131a');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+  // midline
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  for(let y=10;y<H;y+=24) ctx.fillRect(W/2 - 2, y, 4, 12);
+
+  // paddles
+  ctx.fillStyle = '#5eead4';
+  ctx.fillRect(24, state.p1y - state.pH/2, state.pW, state.pH);
+  ctx.fillRect(W - 24 - state.pW, state.p2y - state.pH/2, state.pW, state.pH);
+
+  // ball
+  ctx.beginPath();
+  ctx.arc(state.ball.x, state.ball.y, 8, 0, Math.PI*2);
+  ctx.fillStyle = '#ffd166'; ctx.fill();
+
+  // scores
+  ctx.fillStyle = '#dff6f2';
+  ctx.font = '42px sans-serif';
+  ctx.fillText(state.score1, W/2 - 80, 70);
+  ctx.fillText(state.score2, W/2 + 50, 70);
+
+  // names
+  ctx.font = '16px sans-serif';
+  ctx.fillStyle = '#9fb3c8';
+  ctx.fillText(save.name || 'Player', 24, 30);
+  ctx.fillText(save.nameOpponent || 'Friend', W - 160, 30);
+}
+
+// input handling: pointer or keyboard to move YOUR paddle
+let isPointerDown = false;
+canvas.addEventListener('pointerdown', (e)=>{ isPointerDown = true; onPointerMove(e); canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointerup', (e)=>{ isPointerDown = false; try{ canvas.releasePointerCapture(e.pointerId); }catch(e){} });
+canvas.addEventListener('pointermove', onPointerMove);
+function onPointerMove(e){
+  const rect = canvas.getBoundingClientRect();
+  const y = ((e.clientY - rect.top) / rect.height) * H;
+  // decide which paddle is "you":
+  if(role === 'host' || role === 'local'){
+    state.p1y = clamp(y, state.pH/2, H - state.pH/2);
+  } else { // client controls p2
+    state.p2y = clamp(y, state.pH/2, H - state.pH/2);
+  }
+}
+window.addEventListener('keydown', (e)=>{
+  if(e.key === 'ArrowUp'){ if(role==='host'||role==='local') state.p1y -= 24; else state.p2y -= 24; }
+  if(e.key === 'ArrowDown'){ if(role==='host'||role==='local') state.p1y += 24; else state.p2y += 24; }
+  state.p1y = clamp(state.p1y, state.pH/2, H-state.pH/2);
+  state.p2y = clamp(state.p2y, state.pH/2, H-state.pH/2);
+});
+
+// main loop
+function loop(t){
+  if(!lastTime) lastTime = t;
+  const dt = Math.min(50, t - lastTime) / 16; // Normalize to ~60fps unit
+  lastTime = t;
+
+  if(role === 'host'){
+    // host authoritative: tick physics faster
+    if(state.running){
+      // run multiple physics substeps proportional to dt
+      hostTick(dt);
+    }
+  } else if(role === 'client'){
+    clientTick(dt);
+  } else if(role === 'local'){
+    // local mode: host-like physics
+    if(state.running) hostTick(dt);
+  }
+
+  // Render
+  draw();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// start/stop game via double-click on canvas or button: start both sides
+canvas.addEventListener('dblclick', ()=>{
+  state.running = !state.running;
+  if(state.running) showToast('Старт');
+  else showToast('Пауза');
+});
+
+// On connection established: sync start & reset
+function onConnectedAsHost(){
+  // when host connects, ensure state is reset and send immediate state
+  resetGame();
+  state.running = true;
+  // also send initial state immediately
+  if(dataChannel && dataChannel.readyState === 'open'){
+    sendMsg({type:'state', p1y:state.p1y, p2y:state.p2y, ball:state.ball, score1:state.score1, score2:state.score2});
+  }
+}
+
+// detect when dataChannel opens to call onConnectedAsHost
+(function monitorDCOpen(){
+  setInterval(()=>{
+    if(dataChannel && dataChannel.readyState === 'open' && role === 'host'){
+      onConnectedAsHost();
+    }
+  }, 500);
+})();
+
+// small utilities
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function showToast(msg, t=1500){ const d=document.createElement('div'); d.textContent=msg; d.style.position='fixed'; d.style.left='50%'; d.style.transform='translateX(-50%)'; d.style.bottom='30px'; d.style.background='#062a2a'; d.style.padding='10px 14px'; d.style.borderRadius='8px'; d.style.boxShadow='0 6px 30px rgba(0,0,0,.6)'; d.style.color='#dff6f2'; document.body.appendChild(d); setTimeout(()=>d.remove(), t); }
+
+// when answerOut is pasted by host: allow host to paste client's answer in offerIn field and click "Вставить Answer"
+createAnswer.addEventListener('click', async ()=>{
+  // client-side creation of answer handled in btnClient block; this button is to create answer from current offerIn
+  // It is kept for UX but logic already in btnClient
+  btnClient.click();
+});
+
+// if host wants to paste answer (from friend) into offerIn area, set that as remoteDescription
+document.getElementById('offerIn').addEventListener('input', ()=>{ /* nothing - UI convenience */ });
+
+// When client receives offer and answer is created, the host must paste the answer back manually into the host's "Вставить Answer" (pasteAnswer) flow.
+// That's described in UI.
+
+// Save player name changes
+nameInput.addEventListener('change', ()=>{ save.name = nameInput.value; saveToStorage(); });
+
+// Provide auto-copy when answerOut updated (client)
+answerOut.addEventListener('focus', ()=>{ answerOut.select(); });
+
+// When remote description set and connectionstate becomes 'connected', we can mark connected
+// Also handle when client receives state and wants to start rendering: if role === 'client', state.running is set by incoming state.
+
+// Save final match scores to local record when host detects someone scored > some threshold or on disconnect
+function saveMatchIfNeeded(){
+  const s = `${state.score1}:${state.score2}`;
+  save.records.unshift(s);
+  if(save.records.length>10) save.records.length = 10;
+  saveToStorage();
+}
+setInterval(()=>{ /* periodically save */ saveToStorage(); }, 5000);
+
+// On unload, save
+window.addEventListener('beforeunload', ()=>{ saveToStorage(); });
+
+// Simple heuristic: if we become connected as client and receive first state, set running true locally
+(function monitorStateReception(){
+  let lastBallX = null;
+  setInterval(()=>{
+    if(role === 'client' && state.ball && lastBallX !== state.ball.x){
+      // we are receiving updates
+      state.running = true;
+    }
+    lastBallX = state.ball.x;
+  }, 300);
+})();
+
+</script>
+</body>
+</html>
